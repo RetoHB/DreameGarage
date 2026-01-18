@@ -3,6 +3,7 @@
    Dreame Garagentor v1.2
    Reto Huber
    2026
+   for Xiao ESP32C3 controller
    
  *************************************************************/
 
@@ -670,4 +671,5 @@ void evaluateState() {
     }
   }
 }
+
 
