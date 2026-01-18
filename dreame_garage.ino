@@ -13,10 +13,10 @@
 #include <ArduinoOTA.h>
 #include <esp_task_wdt.h>
 
-#define WIFI_SSID       "TRBH"
-#define WIFI_PASS       "Sponda7084"
-#define IO_USERNAME     "huberret"
-#define IO_KEY          "aio_jIGt79U39bVA7riSlnjez5jfKr6l"
+#define WIFI_SSID       "mySSID"
+#define WIFI_PASS       "myPass"
+#define IO_USERNAME     "myUsername"
+#define IO_KEY          "myKey"
 #define FEED_KEY        "dreame-status";
 
 #define limitSwitch D4
@@ -670,3 +670,4 @@ void evaluateState() {
     }
   }
 }
+
