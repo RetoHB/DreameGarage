@@ -18,3 +18,4 @@ A lightweight HTTP web interface provides local control and status monitoring, o
 - 12V power supply
 - Two drawer slides, shortened
 ### Wiring
+<img width="800" alt="Dreame garage door schematic" src="https://github.com/user-attachments/assets/ac5dcd5c-bf36-4474-be62-4ccb120806eb" />
