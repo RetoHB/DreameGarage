@@ -1,6 +1,6 @@
   /*************************************************************
 
-   Dreame Garage Door v1.2
+   Dreame Garage Door v1.3
    Reto Huber
    2026
    for Xiao ESP32C3 controller
@@ -9,10 +9,12 @@
 
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <WebServer.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncTCP.h>
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
 #include <esp_task_wdt.h>
+#include <time.h>
 
 #define WIFI_SSID       "mySSID"
 #define WIFI_PASS       "myPass"
@@ -29,23 +31,19 @@
 #define IN2    D10     // Input2 to L298N
 
 const unsigned long accelMotorTime = 1000;     // constant for time motor accelerates and decelerates
-unsigned long fullSpeedMotorTime = 2000;       // global variable for time motor runs at full speed
+unsigned long fullSpeedMotorTime = 0;       // global variable for time motor runs at full speed
 const unsigned long fullSpeedUpTime = 1850;    // constant for time motor runs up
 const unsigned long fullSpeedDownTime = 2100;  // constant for time motor runs down
-int maxPWM = 200;                              // global variable for maximum speed
+int maxPWM = 0;                              // global variable for maximum speed
 const int maxPWMup = 160;                      // constant for maximum speed up
 const int maxPWMdown = 120;                    // constant for maximum speed down
 int pwmValue = 0;                              // global variable for current speed
 unsigned long stateStartTime = 0;              // timing variable for motor motion phases (IDLE, ACCEL, FULLSPEED, DECEL)
+bool watchdogNightMode = false;                // track current watchdog mode
 
 bool openDoor = false;      // door action to perform
 bool lastOpenDoor = false;  // last door action
 bool creepDone = false;
-
-bool chargingWaitActive = false;
-bool emptying = false;
-unsigned long chargingWaitStart = 0;
-const unsigned long chargingCloseDelay = 300000; // on charging wait 5 minutes before closing door
 
 // ---------------- LED Blink Variables ----------------
 bool LEDstate = LOW;
@@ -53,31 +51,30 @@ unsigned long lastBlink = 0;
 const unsigned long BLINK_INTERVAL = 200;  // ms
 
 // ------------ Adafruit IO poll variables -------------
-unsigned long lastPoll = 0;                    // time of last poll to Adafruit IO
-const unsigned long POLL_INTERVAL = 500;      // interval in ms to poll Adafruit IO
-String dreame_state = "";                      // current state of Dreame
-String dreame_status = "";                      // current status of Dreame
-String dreame_room = "";                       // current room Dreame is in
-String dreame_task = "";                       // current task of Dreama
-String last_dreame_state = "";                 // last state of Dreame
-String last_dreame_status = "";                 // last status of Dreame
-String last_dreame_room = "";                  // last room Dreame was in
-String last_dreame_task = "";                  // last task of Dreame
-bool updatedData = false;                      // Flag to indicate new data arrived
+unsigned long lastPoll = 0;                   // time of last poll to Adafruit IO
+const unsigned long POLL_INTERVAL = 2000;     // interval in ms to poll Adafruit IO
+String dreame_state = "";                     // current state of Dreame
+String dreame_status = "";                    // current status of Dreame
+String dreame_room = "";                      // current room Dreame is in
+String dreame_task = "";                      // current task of Dreama
+String last_dreame_state = "";                // last state of Dreame
+String last_dreame_status = "";               // last status of Dreame
+String last_dreame_room = "";                 // last room Dreame was in
+String last_dreame_task = "";                 // last task of Dreame
+bool updatedData = false;                     // Flag to indicate new data arrived
+int lastAIOerror = 0;
+unsigned long lastIOupdate = 0;               // time of last update from Adafruit IO
+unsigned long timeBetweenUpdates = 0;         // time between Adafruit IO updates
+struct tm lastResetTime;                      // last time controller was booted
 
 // -------------------- Web Server ---------------------
-WebServer server(80);
+AsyncWebServer server(80);
 
-// -----------------------------------------------------
-
-void handleRoot();
-void handleOpen();
-void handleClose();
-void handleStatus();
-
-//void readAdafruitValue();
-bool readAdafruitFeed();
+void setupTime();
+void configureWatchdog();
+void updateWatchdogByTime();
 void pollAdafruitIO();
+String buildPage();
 void evaluateState();
 void updateDoor();
 void startCalibration();
@@ -113,10 +110,6 @@ MotionState motionState = IDLE;
 
 void setup()
 {
-  // Initialize hardware watchdog (timeout 60 seconds)
-  esp_task_wdt_init(60, true);    // true = reset system on timeout
-  esp_task_wdt_add(NULL);         // add current (loop) task to WDT
-  
   pinMode(limitSwitch, INPUT_PULLUP);
   
   pinMode(LED1, OUTPUT);
@@ -177,14 +170,62 @@ void setup()
   ArduinoOTA.begin();
   Serial.println("OTA ready");
 
-  // ---------- Setup HTTP Routes for Webserver ------------
-  
-  server.on("/", handleRoot);
-  server.on("/open", handleOpen);
-  server.on("/close", handleClose);
-  server.on("/status", handleStatus);
+  setupTime();
+
+  // ---------- Setup handlers for Webserver ------------
+
+  // --------- "root page" offering the command links -----------
+    
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send(200, "text/html",
+                  buildPage("Dreame Garage Door Controller", ""));
+  });
+
+  // ------------------ "open command" page ---------------------
+
+  server.on("/open", HTTP_GET, [](AsyncWebServerRequest *request) {
+    openDoor = true;
+    request->send(200, "text/html",
+                  buildPage("Dreame Garage Door Controller", "Door <b>opening</b> command received."));
+  });
+
+  // ----------------- "close command" page ---------------------
+
+  server.on("/close", HTTP_GET, [](AsyncWebServerRequest *request) {
+    openDoor = false;
+    request->send(200, "text/html",
+                  buildPage("Dreame Garage Door Controller", "Door <b>closing</b> command received."));
+  });
+
+  // --------------------- "status" page ------------------------
+
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String status;
+    switch (doorState) {
+      case DOOR_IDLE:        status = "Idle"; break;
+      case DOOR_CALIBRATING: status = "Calibrating"; break;
+      case DOOR_OPENING:     status = "Opening"; break;
+      case DOOR_CLOSING:     status = "Closing"; break;
+    }
+
+    struct tm timeinfo;
+    char buf1[32];
+    char buf2[32];
+    getLocalTime(&timeinfo);
+    strftime(buf1, sizeof(buf1), "%H:%M", &timeinfo);
+    strftime(buf2, sizeof(buf2), "%H:%M", &lastResetTime);
+
+    String body = "Door is currently: " + status + "<br>Last state was: " + dreame_status + "<br>Current room is: " + dreame_room + "<br>Current task is: " + dreame_task + "<br> ESP reset reason: " + esp_reset_reason() + "<br>Last reset time: " + String(buf2) + "<br>Last AdafruitIO error: " + lastAIOerror + "<br> Time between AIO updates (ms): " + timeBetweenUpdates + "<br>Current time: " + String(buf1) +"<br>";
+
+    request->send(200, "text/html",
+                  buildPage("Dreame Garage Door Controller", body));
+    });               
+
   server.begin();
   Serial.println("HTTP server started.");
+   
+
+  // ----------------- Start door calibration ---------------------
 
   startCalibration();
 }
@@ -214,14 +255,78 @@ void loop()
       pollAdafruitIO();
       evaluateState();
     }
+    updateWatchdogByTime(); // update watchdog periodically
   }
   
   updateDoor();            // Command the door
   updateLED();             // Command the LEDs
   ArduinoOTA.handle();     // Handle OTA
   esp_task_wdt_reset();    // reset watchdog
+}
 
-  server.handleClient();   // Handle incoming HTTP requests
+// ============================================================
+// Function: setupTime()
+// Setup NTP time
+// ============================================================
+
+ void setupTime() {
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    
+    // Central European Time with automatic DST
+    setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+    tzset();
+  
+    Serial.println("Waiting for NTP time sync...");
+    struct tm timeinfo;
+    while (true) {
+      if (getLocalTime(&timeinfo)) {
+        if (timeinfo.tm_year > (2025 - 1900)) break;  // real time arrived
+      }
+      Serial.print(".");
+      delay(500);
+    }
+    delay(5000);
+    Serial.println("\nTime synchronized");
+    getLocalTime(&lastResetTime);
+ }
+
+// ============================================================
+// Function: configureWatchdog(uint32_t timeoutSeconds)
+// helper to reconfigure watchdog safely
+// ============================================================
+
+void configureWatchdog(uint32_t timeoutSeconds) {
+  esp_task_wdt_delete(NULL);          // remove current task
+  esp_task_wdt_deinit();              // stop watchdog
+  esp_task_wdt_init(timeoutSeconds, true);  // restart with new timeout
+  esp_task_wdt_add(NULL);             // re-add loop task
+
+  Serial.print("Watchdog timeout set to ");
+  Serial.print(timeoutSeconds);
+  Serial.println(" seconds");
+}
+
+// ============================================================
+// Function: updateWatchdogByTime()
+// switch watchdog automatically based on time
+// ============================================================
+
+void updateWatchdogByTime() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+
+  int hour = timeinfo.tm_hour;
+
+  bool nightNow = (hour >= 20 || hour < 8);
+
+  if (nightNow != watchdogNightMode) {
+    watchdogNightMode = nightNow;
+
+    if (nightNow)
+      configureWatchdog(3600);
+    else
+      configureWatchdog(60);
+  }
 }
 
 // ============================================================
@@ -306,15 +411,6 @@ void handleMotorSequence() {
 void updateDoor() {
   handleMotorSequence();                // handle the motor continously
 
-  // -------- Handle delayed close after charging --------
-  if (chargingWaitActive && (doorState == DOOR_IDLE)) {
-    if (millis() - chargingWaitStart >= chargingCloseDelay) {
-      Serial.println("Charging delay expired → closing door");
-      chargingWaitActive = false;
-      openDoor = false;
-    }
-  }
-
   switch (doorState) {
     case DOOR_CALIBRATING:
       if (limitReached()) {             // limit switch has triggered
@@ -373,7 +469,6 @@ void startCalibration() {
 }
 
 void startOpening() {
-  chargingWaitActive = false;
   Serial.println("Opening door...");
   doorState = DOOR_OPENING;
   openDoor = true;
@@ -381,7 +476,6 @@ void startOpening() {
 }
 
 void startClosing() {
-  chargingWaitActive = false;
   Serial.println("Closing door...");
   doorState = DOOR_CLOSING;
   openDoor = false;
@@ -434,194 +528,93 @@ void updateLED() {
 }
 
 // ============================================================
-// HTTP handlers
+// HTML page builder
 // ============================================================
 
 // ---- setting up a formatted page to deliver the message ----
 
-void sendPage(String title, String body) {
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body><h2>" + title + "</h2><p>" + body + "</p>"
-                "<p><a href=\"/open\">Open Door</a></p>"
-                "<p><a href=\"/close\">Close Door</a></p>"
-                "<p><a href=\"/status\">Check Status</a></p>"
-                "</body></html>";
-  server.send(200, "text/html", html);
-}
-
-// --------- "root page" offering the command links -----------
-  
-void handleRoot() {
-  String html = "<html><head><meta name='viewport' content='width=device-width, initial-scale=1.0'></head><body>";
-  sendPage("Dreame Garage Door Controller", "");
-}
-
-// ------------------ "open command" page ---------------------
-
-void handleOpen() {
-  chargingWaitActive = false;
-  openDoor = true;
-  sendPage("Dreame Garage Door Controller", "Door <b>opening</b> command received.");
-  Serial.println("HTTP: /open called");
-}
-
-// ----------------- "close command" page ---------------------
-
-void handleClose() {
-  chargingWaitActive = false;
-  openDoor = false;
-  sendPage("Dreame Garage Door Controller", "Door <b>closing</b> command received.");
-  Serial.println("HTTP: /close called");
-}
-
-// --------------------- "status" page ------------------------
-
-void handleStatus() {
-  String status;
-
-  switch (doorState) {
-    case DOOR_IDLE:         status = "Idle"; break;
-    case DOOR_CALIBRATING:  status = "Calibrating"; break;
-    case DOOR_OPENING:      status = "Opening"; break;
-    case DOOR_CLOSING:      status = "Closing"; break;
-  }
-
-  String body = "Door is currently: <b>" + status + "</b><br>Last state was: " + dreame_status + "<br>Current room is: " + dreame_room + "<br>Current task is: " + dreame_task + "<br> ESP reset reason: " + esp_reset_reason() + "<br>";
-  sendPage("Dreame Garage Door Controller", body);
-}
-
-// ============================================================
-// Function: readAdafruitValue()
-// get current state of Dreame from AdafruitIO
-// ============================================================
-
-/*void readAdafruitValue() {
-  HTTPClient http;
-
-  String url = "https://io.adafruit.com/api/v2/";
-  url += IO_USERNAME;
-  url += "/feeds/";
-  url += FEED_KEY;
-  url += "/data/last";
-
-  http.begin(url);
-  http.addHeader("X-AIO-Key", IO_KEY);
-  http.addHeader("Content-Type", "application/json");
-
-  int httpCode = http.GET();
-
-  if (httpCode == HTTP_CODE_OK) {
-    String payload = http.getString();
-
-    // Parse JSON
-    StaticJsonDocument<512> doc;
-    DeserializationError error = deserializeJson(doc, payload);
-
-    if (!error) {
-      String value = doc["value"].as<String>();
-
-      if (lastValue != value) {
-      
-        // Any change cancels pending delayed close
-        chargingWaitActive = false;
-      
-        if ((value == "charging") || (value == "idle") || (value == "standby")) {
-          Serial.println("Charging detected → will close in 5 minutes");
-          chargingWaitActive = true;
-          chargingWaitStart = millis();
-        }
-        else if (value == "sleeping") {
-          Serial.println("Dreame at base → close immediately");
-          openDoor = false;
-        }
-        else {
-          Serial.println("Cleaning → open door");
-          openDoor = true;
-        }
-      
-        lastValue = value;
-      }
-    } else {
-      Serial.print("JSON parse error: ");
-      Serial.println(error.c_str());
-    }
-  } else {
-    Serial.printf("HTTP request failed, code: %d\n", httpCode);
-  }
-
-  http.end();
-}*/
-
-// ============================================================
-// Function: readAdafruitFeed()
-// get value of feedKey from AdafruitIO
-// ============================================================
-
-bool readAdafruitFeed(const String& feedKey, String& outValue) {
-  HTTPClient http;
-  String url = "https://io.adafruit.com/api/v2/";
-  url += IO_USERNAME;
-  url += "/feeds/";
-  url += feedKey;
-  url += "/data/last";
-
-  http.begin(url);
-  http.addHeader("X-AIO-Key", IO_KEY);
-  http.addHeader("Content-Type", "application/json");
-
-  int httpCode = http.GET();
-  if (httpCode != HTTP_CODE_OK) {
-    http.end();
-    return false;
-  }
-
-  StaticJsonDocument<256> doc;
-  DeserializationError err = deserializeJson(doc, http.getString());
-  http.end();
-
-  if (err) return false;
-
-  outValue = doc["value"].as<String>();
-  return true;
+String buildPage(String title, String body) {
+  return
+    "<html><head>"
+    "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
+    "</head><body>"
+    "<h2>" + title + "</h2>"
+    "<p>" + body + "</p>"
+    "<p><a href=\"/open\">Open Door</a></p>"
+    "<p><a href=\"/close\">Close Door</a></p>"
+    "<p><a href=\"/status\">Check Status</a></p>"
+    "</body></html>";
 }
 
 // ============================================================
 // Function: pollAdafruitIO()()
-// get current values of Dreame from AdafruitIO via readAdafruitFeed()
+// get current values of Dreame from AdafruitIO
 // ============================================================
 
 void pollAdafruitIO() {
-  String newState, newStatus, newRoom, newTask;
   bool changed = false;
 
-  if (readAdafruitFeed("dreame-state", newState)) {
-    if (newState != last_dreame_state) {
-      last_dreame_state = newState;
-      dreame_state = newState;
-      changed = true;
-    }
+  HTTPClient http;
+  String url = "https://io.adafruit.com/api/v2/";
+  url += IO_USERNAME;
+  url += "/groups/";
+  url += AIO_GROUP_KEY;
+  url += "/feeds";
+
+  http.begin(url);
+  http.addHeader("X-AIO-Key", IO_KEY);
+
+  int httpCode = http.GET();
+  if (httpCode != HTTP_CODE_OK) {
+    lastAIOerror = httpCode;
+    http.end();
+    return;
   }
 
-  if (readAdafruitFeed("dreame-status", newStatus)) {
-    if (newStatus != last_dreame_status) {
-      last_dreame_status = newStatus;
-      dreame_status = newStatus;
-      changed = true;
-    }
+  StaticJsonDocument<2048> doc;
+  DeserializationError err = deserializeJson(doc, http.getString());
+  http.end();
+
+  if (err) {
+    lastAIOerror = -1;   // JSON error
+    return;
   }
 
-  if (readAdafruitFeed("dreame-room", newRoom)) {
-    if (newRoom != last_dreame_room) {
-      last_dreame_room = newRoom;
-      dreame_room = newRoom;
-      changed = true;
-    }
-  }
+  for (JsonObject feed : doc.as<JsonArray>()) {
+    if (feed["last_value"].isNull()) continue;
 
-  if (readAdafruitFeed("dreame-task", newTask)) {
-    if (newTask != last_dreame_task) {
-      last_dreame_task = newTask;
-      dreame_task = newTask;
-      changed = true;
+    String key   = feed["key"].as<String>();
+    String value = feed["last_value"].as<String>();
+
+    if (key == "dreame-state") {
+      timeBetweenUpdates = millis() - lastIOupdate;
+      lastIOupdate = millis();
+      if (value != last_dreame_state) {
+        last_dreame_state = value;
+        dreame_state = value;
+        changed = true;
+      }
+    }
+    else if (key == "dreame-status") {
+      if (value != last_dreame_status) {
+        last_dreame_status = value;
+        dreame_status = value;
+        changed = true;
+      }
+    }
+    else if (key == "dreame-room") {
+      if (value != last_dreame_room) {
+        last_dreame_room = value;
+        dreame_room = value;
+        changed = true;
+      }
+    }
+    else if (key == "dreame-task") {
+      if (value != last_dreame_task) {
+        last_dreame_task = value;
+        dreame_task = value;
+        changed = true;
+      }
     }
   }
 
@@ -636,41 +629,30 @@ void pollAdafruitIO() {
 void evaluateState() {
   if (!updatedData) return;
   updatedData = false;
-
-  // Any change cancels pending delayed close
-  chargingWaitActive = false;
+  
+  if (dreame_room != "Kitchen") {
+    Serial.println("Dreame not in Kitchen → close");
+    openDoor = false;
+    return;
+  }  
 
   if (dreame_state == "auto_emptying") {
-    Serial.println("Dreame auto-emptying → close immediately");
+    Serial.println("Dreame auto-emptying → close");
     openDoor = false;
-    emptying = true;
+    return;
   }
 
-  if (emptying && (dreame_state != "auto_emptying")) {
-    Serial.println("Dreame auto-emptying finished → open again");
+  if (((dreame_status == "charging") ||
+       (dreame_status == "idle") ||
+       (dreame_status == "standby") ||
+       (dreame_status == "sleeping") ||
+       (dreame_status == "unavailable")) &&
+       (dreame_task != "cleaning")) {
+    Serial.println("Dreame is docked and task completed → close");
+    openDoor = false;
+  }
+  else {
+    Serial.println("Dreame is in Kitchen and still working → open");
     openDoor = true;
   }
-
-  if (dreame_room != "Kitchen") {
-    Serial.println("Dreame not in Kitchen → close immediately");
-    openDoor = false;
-  }
-  else {      
-    if ((dreame_status == "charging") || (dreame_status == "idle") || (dreame_status == "standby")) {
-      Serial.println("Charging detected → will close in 5 minutes");
-      chargingWaitActive = true;
-      chargingWaitStart = millis();
-    }
-    else if (dreame_status == "sleeping") {
-      Serial.println("Dreame at base → close immediately");
-      openDoor = false;
-    }
-    else {
-      Serial.println("Cleaning → open door");
-      openDoor = true;
-    }
-  }
 }
-
-
-
