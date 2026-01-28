@@ -4,7 +4,7 @@ A WiFi-connected garage door controller that automatically opens and closes a ga
 ## General Description
 The system uses an ESP-based microcontroller to control a DC motor through an L298N H-bridge. Motor movement is handled using a non-blocking state machine with controlled acceleration and deceleration, ensuring smooth and predictable motion.
 On startup, the controller performs an automatic calibration cycle using a limit switch to establish a known reference position. This allows the door to recover correctly after resets or power interruptions.
-The controller periodically reads the Dreame vacuum state from Adafruit IO, which is updated by Home Assistant. Based on this state, the door opens when the vacuum starts cleaning and closes when it returns to its base or enters charging mode, optionally after a configurable delay.
+The controller periodically reads the Dreame vacuum state from Adafruit IO, which is updated by Home Assistant. Based on this state, the door opens when the vacuum starts cleaning and closes when it returns to its base or enters charging mode.
 
 A lightweight HTTP web interface provides local control and status monitoring. A hardware watchdog is used to automatically reset the controller if the main loop stalls, ensuring continued operation without user intervention.
 
